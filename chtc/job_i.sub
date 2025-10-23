@@ -5,7 +5,7 @@ request_memory = 50GB
 request_disk = 50GB
 
 # Extra GPU settings
-request_gpus            = 2
+request_gpus            = 1
 
 # change to true if *not* using staging for checkpoints and interested in accessing GPUs beyond CHTC
 +WantGPULab = true
