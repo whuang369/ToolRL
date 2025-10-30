@@ -79,8 +79,7 @@ class MegatronPPOActor(BasePPOActor):
                 The actor module has some constraints to follow in order to use the updating logics implemented here
 
                 1. It must implement unpad_input before any computation and pad_input after all the computation. Remove padding is an
-                optimization that removes the padding tokens. See unpad_input and pad_input function in flash-attn
-                (https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py).
+                optimization that removes the padding tokens. See typical unpad/pad implementations used with attention kernels.
 
                 2. Each pp stage must return the hidden state with the same shape [total_nnz, 1, hidden_size],
                 where total_nnz is the number of valid tokens in this batch. If sequence parallel is enabled, the size

@@ -209,7 +209,7 @@ class ParallelLlamaForCausalLM(nn.Module):
         )
 
 
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+from verl.utils.torch_functional import get_unpad_data
 
 
 class ParallelLlamaModelRmPad(nn.Module):
@@ -323,8 +323,8 @@ class ParallelLlamaForCausalLMRmPad(nn.Module):
         batch_size, sequence_length = input_ids.shape
 
         # remove padding here
-        input_ids, indices, cu_seqlens, max_seqlen_in_batch, *_ = unpad_input(input_ids.unsqueeze(dim=-1),
-                                                                              attention_mask)  # (total_nnz, 1)
+        indices, cu_seqlens, max_seqlen_in_batch = get_unpad_data(attention_mask)
+        input_ids = input_ids.view(-1, 1).index_select(0, indices)  # (total_nnz, 1)
 
         # pad input_ids to multiple of tp for all tp ranks
         # TODO: for better performance, the sp padding should be removed at each layer. Not sure the performance gap
@@ -351,8 +351,9 @@ class ParallelLlamaForCausalLMRmPad(nn.Module):
 
         logits = torch.squeeze(logits, dim=1)  # remove the artificial batch dimension
         # add removed padding back
-        logits = pad_input(logits, indices, batch_size,
-                           seqlen=sequence_length)  # (batch_size, sequence_length, vocab_size)
+        flat = torch.zeros(batch_size * sequence_length, logits.size(-1), device=logits.device, dtype=logits.dtype)
+        flat.index_copy_(0, indices, logits)
+        logits = flat.view(batch_size, sequence_length, -1)
 
         return CausalLMOutputWithPast(
             loss=None,
@@ -581,8 +582,8 @@ class ParallelLlamaForCausalLMRmPadPP(nn.Module):
         # In the first pp, input_ids will be used, in other pp layers hidden_states will be used inside self.model
         batch_size, sequence_length = input_ids.shape
         # remove padding here
-        input_ids_rmpad, indices, cu_seqlens, max_seqlen_in_batch, *_ = unpad_input(input_ids.unsqueeze(dim=-1),
-                                                                                    attention_mask)  # (total_nnz, 1)
+        indices, cu_seqlens, max_seqlen_in_batch = get_unpad_data(attention_mask)
+        input_ids_rmpad = input_ids.view(-1, 1).index_select(0, indices)  # (total_nnz, 1)
 
         # pad input_ids to multiple of tp for all tp ranks
         # TODO: for better performance, the sp padding should be removed at each layer. Not sure the performance gap
@@ -609,8 +610,9 @@ class ParallelLlamaForCausalLMRmPadPP(nn.Module):
                 totol_nnz = cu_seqlens[-1]
                 logits = logits[:totol_nnz]  # (total_nnz_padded)
             # add removed padding back. If input is already rmpad, we let the caller pad_input
-            logits = pad_input(logits, indices, batch_size,
-                               seqlen=sequence_length)  # (batch_size, sequence_length, vocab_size)
+            flat = torch.zeros(batch_size * sequence_length, logits.size(-1), device=logits.device, dtype=logits.dtype)
+            flat.index_copy_(0, indices, logits)
+            logits = flat.view(batch_size, sequence_length, -1)
 
             return CausalLMOutputWithPast(
                 loss=None,

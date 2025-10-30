@@ -24,11 +24,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from torch import nn
 
-try:
-    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
-    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
-except ImportError:
-    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
 
 def gather_from_labels(data, label):
@@ -63,8 +59,8 @@ def logprobs_from_logits(logits, labels):
 
 
 def logprobs_from_logits_flash_attn(logits, labels):
-    output = -cross_entropy_loss(logits, labels)[0]
-    return output
+    # Flash-Attn path removed; fallback to naive
+    return logprobs_from_logits_naive(logits, labels)
 
 
 def logprobs_from_logits_naive(logits, labels):
@@ -310,17 +306,18 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
         logits_rmpad: [total_nnz, vocab_size]
         response_length: int
     """
-    from flash_attn.bert_padding import pad_input, unpad_input
+    indices, cu_seqlens, _ = get_unpad_data(attention_mask)
 
     batch_size, seqlen = input_ids.shape
     input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)
     input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
     full_log_probs_rmpad = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)  # (total_nnz,)
-    full_output = pad_input(hidden_states=full_log_probs_rmpad.unsqueeze(-1),
-                            indices=indices,
-                            batch=batch_size,
-                            seqlen=seqlen)
+    # scatter back to padded
+    dim = 1
+    flat = torch.zeros(batch_size * seqlen, 1, device=logits_rmpad.device, dtype=full_log_probs_rmpad.dtype)
+    flat.index_copy_(0, indices, full_log_probs_rmpad.unsqueeze(-1))
+    full_output = flat.view(batch_size, seqlen, 1)
     output = full_output.squeeze(-1)[:, -response_length - 1:-1]  # [batch_size, response_length]
     return output
 
@@ -340,15 +337,13 @@ def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batc
         seqlen: int
         response_length: int
     """
-    from flash_attn.bert_padding import pad_input
     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # transpose back to [total_nnz, 1]
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)
     input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
     full_log_probs_rmpad = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)  # (total_nnz,)
-    full_output = pad_input(hidden_states=full_log_probs_rmpad.unsqueeze(-1),
-                            indices=indices,
-                            batch=batch_size,
-                            seqlen=seqlen)
+    flat = torch.zeros(batch_size * seqlen, 1, device=logits_rmpad.device, dtype=full_log_probs_rmpad.dtype)
+    flat.index_copy_(0, indices, full_log_probs_rmpad.unsqueeze(-1))
+    full_output = flat.view(batch_size, seqlen, 1)
     output = full_output.squeeze(-1)[:, -response_length - 1:-1]  # [batch_size, response_length]
     return output
 

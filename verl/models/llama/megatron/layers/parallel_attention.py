@@ -286,53 +286,45 @@ Remove padding Attention
 - Compatible with sequence parallel
 """
 
-from transformers.utils import is_flash_attn_2_available
 import torch.nn.functional as F
 
 from einops import rearrange
 
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
 
 def apply_rotary_pos_emb_rmpad(q, k, cos, sin, position_ids, indices, sequence_length):
+    # q,k: (total_nnz, num_heads, head_dim)
     batch_size = position_ids.shape[0]
+    max_seqlen = sequence_length
+    num_heads_q, head_dim_q = q.size(1), q.size(2)
+    num_heads_k, head_dim_k = k.size(1), k.size(2)
 
-    q = pad_input(q, indices, batch_size, sequence_length)  # (batch_size, seqlen, num_head, head_dim)
-    k = pad_input(k, indices, batch_size, sequence_length)
-    cos = cos[position_ids].unsqueeze(2)  # [bs, seq_len, 1, dim]
-    sin = sin[position_ids].unsqueeze(2)  # [bs, seq_len, 1, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_padded = _pad_from_unpadded(q.view(q.size(0), -1), indices, batch_size, max_seqlen)
+    k_padded = _pad_from_unpadded(k.view(k.size(0), -1), indices, batch_size, max_seqlen)
 
-    q_embed = index_first_axis(rearrange(q_embed, "b s ... -> (b s) ..."), indices)
-    k_embed = index_first_axis(rearrange(k_embed, "b s ... -> (b s) ..."), indices)
+    q_padded = q_padded.view(batch_size, max_seqlen, num_heads_q, head_dim_q).transpose(1, 2)
+    k_padded = k_padded.view(batch_size, max_seqlen, num_heads_k, head_dim_k).transpose(1, 2)
 
-    return q_embed, k_embed
+    q_embed, k_embed = apply_rotary_pos_emb(q_padded, k_padded, cos, sin, position_ids)
+
+    q_flat = q_embed.transpose(1, 2).contiguous().view(batch_size * max_seqlen, num_heads_q * head_dim_q)
+    k_flat = k_embed.transpose(1, 2).contiguous().view(batch_size * max_seqlen, num_heads_k * head_dim_k)
+
+    q_unpad = _unpad_to_indices(q_flat, indices).view(-1, num_heads_q, head_dim_q)
+    k_unpad = _unpad_to_indices(k_flat, indices).view(-1, num_heads_k, head_dim_k)
+    return q_unpad, k_unpad
 
 
-from flash_attn.layers.rotary import apply_rotary_emb
+def _pad_from_unpadded(x: torch.Tensor, indices: torch.Tensor, batch_size: int, max_seqlen: int) -> torch.Tensor:
+    # x: (total_nnz, dim). indices: (total_nnz,) flattened indices into (batch_size*max_seqlen)
+    dim = x.size(-1)
+    padded = x.new_zeros((batch_size * max_seqlen, dim))
+    padded.index_copy_(0, indices, x)
+    return padded.view(batch_size, max_seqlen, dim)
 
 
-# use flash-attn rotary embeddings with rmpad
-# cos/sin shoudl be: (seq_length, rotary_dim / 2)
-def apply_rotary_pos_emb_rmpad_flash(q, k, cos, sin, cu_seqlens, max_seqlen):
-    q_embed = apply_rotary_emb(q,
-                               cos,
-                               sin,
-                               interleaved=False,
-                               inplace=False,
-                               cu_seqlens=cu_seqlens,
-                               max_seqlen=max_seqlen)
-    k_embed = apply_rotary_emb(k,
-                               cos,
-                               sin,
-                               interleaved=False,
-                               inplace=False,
-                               cu_seqlens=cu_seqlens,
-                               max_seqlen=max_seqlen)
-    return q_embed, k_embed
+def _unpad_to_indices(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    # x: (batch_size*max_seqlen, dim)
+    return x.index_select(0, indices)
 
 
 class ParallelLlamaAttentionRmPad(ParallelLlamaAttention):
@@ -360,54 +352,53 @@ class ParallelLlamaAttentionRmPad(ParallelLlamaAttention):
             key_states = key_states[:total_nnz]
             value_states = value_states[:total_nnz]
 
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dime x hidden_dim
-        # therefore we just need to keep the original shape
+        # Build padded tensors from unpadded using indices and cu_seqlens
+        batch_size = position_ids.size(0)
+
+        # reshape heads
         query_states = query_states.view(total_nnz, self.num_heads_per_tp, self.head_dim)
         key_states = key_states.view(total_nnz, self.num_key_value_heads_per_tp, self.head_dim)
         value_states = value_states.view(total_nnz, self.num_key_value_heads_per_tp, self.head_dim)
 
-        cos, sin = self.rotary_emb(value_states, seq_len=sequence_length)
-        cos, sin = cos[:, :cos.shape[1] // 2], sin[:, :sin.shape[1] // 2]  # flash attn only needs half
-        query_states, key_states = apply_rotary_pos_emb_rmpad_flash(query_states,
-                                                                    key_states,
-                                                                    cos,
-                                                                    sin,
-                                                                    cu_seqlens=cu_seqlens,
-                                                                    max_seqlen=max_seqlen_in_batch)
-        # query_states, key_states = apply_rotary_pos_emb_rmpad(query_states, key_states, cos, sin, position_ids, indices,
+        # Pad back to (bsz, max_seqlen, ...)
+        q_padded = _pad_from_unpadded(query_states.view(total_nnz, -1), indices, batch_size, max_seqlen_in_batch)
+        k_padded = _pad_from_unpadded(key_states.view(total_nnz, -1), indices, batch_size, max_seqlen_in_batch)
+        v_padded = _pad_from_unpadded(value_states.view(total_nnz, -1), indices, batch_size, max_seqlen_in_batch)
 
-        # TODO: llama does not have dropout in the config??
-        # It is recommended to use dropout with FA according to the docs
-        # when training.
-        dropout_rate = 0.0  # if not self.training else self.attn_dropout
+        # reshape to (bsz, num_heads, seqlen, head_dim)
+        q_padded = q_padded.view(batch_size, max_seqlen_in_batch, self.num_heads_per_tp, self.head_dim).transpose(1, 2)
+        k_padded = k_padded.view(batch_size, max_seqlen_in_batch, self.num_key_value_heads_per_tp, self.head_dim).transpose(1, 2)
+        v_padded = v_padded.view(batch_size, max_seqlen_in_batch, self.num_key_value_heads_per_tp, self.head_dim).transpose(1, 2)
 
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in float16 just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (LlamaRMSNorm handles it correctly)
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            query_states = query_states.to(torch.float16)
-            key_states = key_states.to(torch.float16)
-            value_states = value_states.to(torch.float16)
+        # RoPE on padded sequences
+        cos, sin = self.rotary_emb(v_padded, seq_len=max_seqlen_in_batch)
+        q_padded, k_padded = apply_rotary_pos_emb(q_padded, k_padded, cos, sin, position_ids)
 
-        attn_output_unpad = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen_in_batch,
-            max_seqlen_k=max_seqlen_in_batch,
+        # repeat kv heads
+        k_padded = repeat_kv(k_padded, self.num_key_value_groups)
+        v_padded = repeat_kv(v_padded, self.num_key_value_groups)
+
+        # Build key padding mask from cu_seqlens
+        lengths = cu_seqlens.diff()
+        device = q_padded.device
+        arange = torch.arange(max_seqlen_in_batch, device=device).unsqueeze(0)
+        key_padding_mask = arange >= lengths.unsqueeze(1)  # (bsz, seqlen) True for pad
+        attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (bsz,1,1,seqlen)
+
+        # SDPA
+        dropout_rate = 0.0
+        attn_output_padded = F.scaled_dot_product_attention(
+            q_padded, k_padded, v_padded,
+            attn_mask=attn_mask,
             dropout_p=dropout_rate,
-            softmax_scale=None,
-            causal=True,
-        )
+            is_causal=True
+        )  # (bsz, num_heads, seqlen, head_dim)
 
-        attn_output_unpad = attn_output_unpad.to(input_dtype)
-        attn_output_unpad = attn_output_unpad.reshape(total_nnz, 1, self.hidden_size_per_tp).contiguous()
+        # project back
+        attn_output_padded = attn_output_padded.transpose(1, 2).contiguous().view(batch_size, max_seqlen_in_batch, -1)
+        attn_output_flat = attn_output_padded.view(batch_size * max_seqlen_in_batch, -1)
+        attn_output_unpad = _unpad_to_indices(attn_output_flat, indices)
+        attn_output_unpad = attn_output_unpad.view(total_nnz, 1, self.hidden_size_per_tp).contiguous()
 
         # sequence parallel reduce_scatter is performed inside RowColumnParallel if enabled
         # Here we need to repad

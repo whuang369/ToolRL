@@ -174,14 +174,14 @@ class MegatronPPOCritic(BasePPOCritic):
         batch_generator = make_batch_generator(batches, vpp_size=len(self.critic_module))
 
         # TODO: we may use the new schedule instead
-        # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
+        # sequence packing: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=batch_generator,
                 model=self.critic_module,
                 num_microbatches=n_micro_batch,
-                input_shapes=input_shapes,  # must set for flash-attn sequence packing
+                input_shapes=input_shapes,
                 seq_length=self.config.ppo_micro_batch_size * seq_len,  # no use when input_shapes was set
                 hidden_size=self.model_config.hidden_size,  # no use when input_shapes was set
                 micro_batch_size=1,  # no use when input_shapes was set

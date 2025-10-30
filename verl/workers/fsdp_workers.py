@@ -855,7 +855,6 @@ class RewardModelWorker(Worker):
         torch.cuda.empty_cache()
 
     def _forward_micro_batch(self, micro_batch):
-        from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
         from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -864,44 +863,12 @@ class RewardModelWorker(Worker):
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
 
-            if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-
-                # unpad the position_ids to align the rotary
-                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                      indices).transpose(0, 1)
-
-                # pad and slice the inputs if sp > 1
-                if self.ulysses_sequence_parallel_size > 1:
-                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, \
-                                                                                                position_ids_rmpad, \
-                                                                                                sp_size=self.ulysses_sequence_parallel_size)
-
-                # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.reward_module(input_ids=input_ids_rmpad,
-                                            attention_mask=None,
-                                            position_ids=position_ids_rmpad,
-                                            use_cache=False)  # prevent model thinks we are generating
-                reward_rmpad = output.logits
-                reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
-
-                # gather output if sp > 1
-                if self.ulysses_sequence_parallel_size > 1:
-                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad,
-                                                           gather_dim=0,
-                                                           unpad_dim=0,
-                                                           padding_size=pad_size)
-
-                # pad it back
-                rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
-            else:
-                output = self.reward_module(input_ids=input_ids,
-                                            attention_mask=attention_mask,
-                                            position_ids=position_ids)
-                rm_score = output.logits  # (batch_size, seq_len, 1)
-                rm_score = rm_score.squeeze(-1)
+            # Use standard padded forward path (SDPA-based attention handles padding via masks)
+            output = self.reward_module(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        position_ids=position_ids)
+            rm_score = output.logits  # (batch_size, seq_len, 1)
+            rm_score = rm_score.squeeze(-1)
 
             # extract the result of the last valid token
             eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
