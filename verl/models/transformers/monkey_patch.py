@@ -13,22 +13,36 @@
 # limitations under the License.
 """
 Apply monkey-patch function to models
+This patches SDPA attention classes to use custom forward functions with Ulysses sequence parallelism support.
 """
 
 #### Open Source Models
 #### transformers version < 4.48
+#### Using SDPA (scaled_dot_product_attention) instead of FlashAttention2
 
 
 def apply_monkey_patch_to_llama():
-    from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-    from verl.models.transformers.llama import llama_flash_attn_forward
-    LlamaFlashAttention2.forward = llama_flash_attn_forward
+    try:
+        from transformers.models.llama.modeling_llama import LlamaSdpaAttention
+        from verl.models.transformers.llama import llama_flash_attn_forward
+        LlamaSdpaAttention.forward = llama_flash_attn_forward
+    except ImportError:
+        # Fallback to LlamaAttention if SdpaAttention is not available
+        from transformers.models.llama.modeling_llama import LlamaAttention
+        from verl.models.transformers.llama import llama_flash_attn_forward
+        LlamaAttention.forward = llama_flash_attn_forward
 
 
 def apply_monkey_patch_to_qwen2():
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2FlashAttention2
-    from verl.models.transformers.qwen2 import qwen2_flash_attn_forward
-    Qwen2FlashAttention2.forward = qwen2_flash_attn_forward
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2SdpaAttention
+        from verl.models.transformers.qwen2 import qwen2_flash_attn_forward
+        Qwen2SdpaAttention.forward = qwen2_flash_attn_forward
+    except ImportError:
+        # Fallback to Qwen2Attention if SdpaAttention is not available
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
+        from verl.models.transformers.qwen2 import qwen2_flash_attn_forward
+        Qwen2Attention.forward = qwen2_flash_attn_forward
 
 
 _PATCH_NAME_TO_FUNC = {

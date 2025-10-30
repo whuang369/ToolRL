@@ -11,7 +11,7 @@ Common modelzoo such as huggingface/transformers stuggles when using Pytorch nat
     - input_ids (total_nnz,)
     - cu_seqlens (total_nnz + 1,)
     - max_seqlen_in_batch: int
-- Note that this requires using flash attention with causal mask.
+- Note that this requires using causal mask (supported by SDPA with is_causal=True).
 
 ### Step 2.5: Add tests
 - Add a test to compare this version and the huggingface version

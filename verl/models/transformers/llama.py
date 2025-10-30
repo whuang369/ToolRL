@@ -14,12 +14,12 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from typing import Optional, List, Union, Tuple, Unpack, Callable
 
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 from transformers.cache_utils import Cache
 from transformers.utils import logging
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from verl.utils.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads, get_ulysses_sequence_parallel_world_size
 
 logger = logging.get_logger(__name__)
@@ -47,9 +47,9 @@ def llama_flash_attn_forward(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    # Flash attention requires the input to have the shape
-    # batch_size x seq_length x head_dim x hidden_dim
-    # therefore we just need to keep the original shape
+    # SDPA expects the input to have the shape
+    # batch_size x num_heads x seq_length x head_dim
+    # which we achieve with transpose(1, 2)
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -85,11 +85,9 @@ def llama_flash_attn_forward(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-    # to be able to avoid many of these transpose/reshape/view.
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
+    # SDPA expects shape (batch, num_heads, seq_len, head_dim) which we already have after transpose
+    # No need to transpose again since we're keeping (batch, num_heads, seq_len, head_dim)
+    # query_states, key_states, value_states are already in shape (bsz, num_heads, seq_len, head_dim)
 
     dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -118,20 +116,32 @@ def llama_flash_attn_forward(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-    attn_output = _flash_attention_forward(
+    # Convert attention_mask for SDPA if provided
+    # SDPA expects attn_mask to be None, bool mask, or float mask
+    attn_mask = None
+    if attention_mask is not None:
+        # Convert attention_mask to bool if needed
+        if attention_mask.dtype == torch.bool:
+            attn_mask = attention_mask
+        else:
+            # Convert from float mask (0s and 1s) to bool (False/True)
+            attn_mask = attention_mask.bool()
+
+    # Use scaled_dot_product_attention
+    # Shapes: query (bsz, num_heads, seq_len, head_dim), same for key and value
+    attn_output = F.scaled_dot_product_attention(
         query_states,
         key_states,
         value_states,
-        attention_mask,
-        full_q_len,
-        position_ids=position_ids,
-        dropout=dropout_rate,
-        sliding_window=getattr(self, "sliding_window", None),
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
-        is_causal=self.is_causal,
-        **kwargs,
+        attn_mask=attn_mask,
+        dropout_p=dropout_rate,
+        is_causal=self.is_causal if attn_mask is None else False,
+        scale=None,  # Use default scaling (1/sqrt(head_dim))
     )
 
+    # attn_output shape: (bsz, num_heads, seq_len, head_dim)
+    # Reshape to (bsz, seq_len, num_heads, head_dim) for output projection
+    attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, full_q_len, -1, self.head_dim).contiguous()
     ########## AlltoAll for Ulysses ##########
     if ulysses_sp_size > 1:

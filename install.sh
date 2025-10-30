@@ -14,5 +14,6 @@ pip install ray
 # verl
 pip install -e .
 
-# flash attention 2
-pip install flash-attn --no-build-isolation
+# Note: flash-attention is no longer required. The codebase now uses PyTorch's scaled_dot_product_attention (SDPA).
+# If you need flash-attention for other purposes, you can install it with:
+# pip install flash-attn --no-build-isolation

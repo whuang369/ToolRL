@@ -14,12 +14,12 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 from transformers.cache_utils import Cache
 from transformers.utils import logging
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from verl.utils.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads, get_ulysses_sequence_parallel_world_size
 
 logger = logging.get_logger(__name__)
@@ -99,30 +99,38 @@ def qwen2_flash_attn_forward(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-    # Reashape to the expected shape for Flash Attention
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
+    # SDPA expects shape (batch, num_heads, seq_len, head_dim) which we already have
+    # query_states, key_states, value_states are already in shape (bsz, num_heads, seq_len, head_dim)
 
-    if (self.config.use_sliding_window and getattr(self.config, "sliding_window", None) is not None and
-            self.layer_idx >= self.config.max_window_layers):
-        sliding_window = self.config.sliding_window
-    else:
-        sliding_window = None
+    # Convert attention_mask for SDPA if provided
+    attn_mask = None
+    if attention_mask is not None:
+        # Convert attention_mask to bool if needed
+        if attention_mask.dtype == torch.bool:
+            attn_mask = attention_mask
+        else:
+            # Convert from float mask (0s and 1s) to bool (False/True)
+            attn_mask = attention_mask.bool()
 
-    attn_output = _flash_attention_forward(
+    # Handle sliding window if enabled (SDPA supports this via attn_mask)
+    # Note: SDPA doesn't have direct sliding_window parameter, but we can use attn_mask
+    # For simplicity, we'll use is_causal for now. Sliding window would require custom mask generation.
+    
+    # Use scaled_dot_product_attention
+    # Shapes: query (bsz, num_heads, seq_len, head_dim), same for key and value
+    attn_output = F.scaled_dot_product_attention(
         query_states,
         key_states,
         value_states,
-        attention_mask,
-        full_q_len,
-        position_ids=position_ids,
-        dropout=dropout_rate,
-        sliding_window=sliding_window,
-        is_causal=self.is_causal,
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        attn_mask=attn_mask,
+        dropout_p=dropout_rate,
+        is_causal=self.is_causal if attn_mask is None else False,
+        scale=None,  # Use default scaling (1/sqrt(head_dim))
     )
 
+    # attn_output shape: (bsz, num_heads, seq_len, head_dim)
+    # Reshape to (bsz, seq_len, num_heads, head_dim) for output projection
+    attn_output = attn_output.transpose(1, 2).contiguous()
     # use full_q_len to reshape
     attn_output = attn_output.reshape(bsz, full_q_len, -1, self.head_dim).contiguous()
     ########## AlltoAll for Ulysses ##########

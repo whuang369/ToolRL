@@ -17,14 +17,13 @@ pip install vllm==0.6.3
 pip install ray
 ```
 
-Please further install the verl in the current project and flash attention.
+Please further install the verl in the current project.
 ```
 # verl
 pip install -e .
-
-# flash attention 2
-pip install flash-attn --no-build-isolation
 ```
+
+Note: The codebase now uses PyTorch's native `scaled_dot_product_attention` (SDPA) instead of flash-attention, so flash-attention is no longer required.
 
 ## 📊 Dataset
 We provide the raw dataset in `./dataset/rlla_4k_raw`, which consists of 2K ToolACE data, 1K Hammer (Masked) data, and 1K xLAM data.
